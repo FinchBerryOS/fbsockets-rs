@@ -1,43 +1,55 @@
 // SPDX-License-Identifier: MIT
-//! **wireframe** — robust async IPC protocol for Unix domain sockets.
+//! `fbsockets` — low-level framed IPC over Unix domain sockets.
 //!
-//! Features:
-//! - Frame-based send/recv over Unix domain sockets (SOCK_STREAM).
-//! - File descriptor passing via SCM_RIGHTS (up to 253 per frame).
-//! - Payload up to 1 MiB per frame.
-//! - **Split API**: `SendHalf` / `RecvHalf` — no interleaving possible.
-//! - **Timeouts**: configurable per-operation deadlines.
-//! - **Keepalive**: background heartbeat frames help detect dead connections.
-//! - **Fork detection**: any send/recv after fork returns an error.
-//! - Full EINTR / partial-write handling.
-//! - `OwnedFd`-based FD lifecycle (CLOEXEC, auto-close on drop).
+//! Default API:
+//! - blocking [`Connection`] and [`Listener`]
+//! - one send operation and one receive operation at a time
+//! - up to 16 MiB payload per message
+//! - up to 64 file descriptors per message
+//! - fork detection: inherited sockets are shut down in the child on first use
 //!
-//! # Quick start
+//! Optional feature:
+//! - `async`: enables [`r#async::Connection`] and [`r#async::Listener`] on top of Tokio
 //!
+//! # Blocking example
 //! ```rust,no_run
-//! use wireframe::{Connection, Listener};
-//! use wireframe::proto::{Config, FLAG_NONE};
+//! use fbsockets::{Config, Connection};
 //!
-//! # async fn demo() -> wireframe::proto::Result<()> {
-//! // Server
-//! let listener = Listener::bind_clean("/tmp/wireframe.sock")?;
-//! let conn = listener.accept(Config::default()).await?;
-//! let (tx, mut rx) = conn.split();
-//! let frame = rx.recv().await?;
+//! # fn demo() -> fbsockets::Result<()> {
+//! let conn = Connection::connect("/tmp/fbsockets.sock", Config::default())?;
+//! conn.send(b"ping", &[])?;
+//! let (data, fds) = conn.recv()?;
+//! assert_eq!(data, b"pong");
+//! assert!(fds.is_empty());
+//! # Ok(())
+//! # }
+//! ```
 //!
-//! // Client
-//! let client = Connection::connect("/tmp/wireframe.sock", Config::default()).await?;
-//! let (mut ctx, _crx) = client.split();
-//! ctx.send(FLAG_NONE, b"ping", &[]).await?;
+//! # Async example
+//! ```rust,no_run
+//! # #[cfg(feature = "async")]
+//! # async fn demo() -> fbsockets::Result<()> {
+//! use fbsockets::{Config};
+//! use fbsockets::r#async::Connection;
+//!
+//! let conn = Connection::connect("/tmp/fbsockets.sock", Config::default()).await?;
+//! conn.send(b"ping", &[]).await?;
+//! let (data, fds) = conn.recv().await?;
+//! assert_eq!(data, b"pong");
+//! assert!(fds.is_empty());
 //! # Ok(())
 //! # }
 //! ```
 
-pub mod proto;
-pub mod pid_guard;
-pub mod scm;
 pub mod connection;
 pub mod listener;
+pub mod pid_guard;
+pub mod proto;
+pub mod scm;
 
-pub use connection::{Connection, SendHalf, RecvHalf};
+#[cfg(feature = "async")]
+pub mod r#async;
+
+pub use connection::Connection;
 pub use listener::Listener;
+pub use proto::{Config, Message, ProtoError, Result};

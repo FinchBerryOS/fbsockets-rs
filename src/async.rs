@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
-//! Blocking framed connection with direct `Connection::send()` / `Connection::recv()` API.
+//! Optional Tokio-based async API.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::io::Interest;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::pid_guard::PidGuard;
 use crate::proto::{self, Config, HEADER_LEN, MAX_FDS, Message, ProtoError};
@@ -56,7 +59,7 @@ pub struct Connection {
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Connection")
+        f.debug_struct("AsyncConnection")
             .field("fd", &self.socket.stream.as_raw_fd())
             .field("owner_pid", &self.guard.owner_pid())
             .field("send_poisoned", &self.send_poisoned.load(Ordering::Relaxed))
@@ -67,7 +70,6 @@ impl std::fmt::Debug for Connection {
 
 impl Connection {
     pub fn from_stream(stream: UnixStream, config: Config) -> Self {
-        let _ = stream.set_nonblocking(true);
         Self {
             socket: SharedSocket::new(stream),
             guard: Arc::new(PidGuard::new()),
@@ -81,117 +83,50 @@ impl Connection {
         }
     }
 
-    pub fn connect<P: AsRef<std::path::Path>>(path: P, config: Config) -> proto::Result<Self> {
-        let stream = UnixStream::connect(path)?;
+    pub async fn connect<P: AsRef<Path>>(path: P, config: Config) -> proto::Result<Self> {
+        let stream = UnixStream::connect(path).await?;
         Ok(Self::from_stream(stream, config))
     }
 
-    #[inline]
-    pub fn owner_pid(&self) -> u32 {
-        self.guard.owner_pid()
-    }
-
-    #[inline]
-    pub fn is_send_poisoned(&self) -> bool {
-        self.send_poisoned.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn is_recv_poisoned(&self) -> bool {
-        self.recv_poisoned.load(Ordering::Relaxed)
-    }
-
-    pub fn send(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> proto::Result<()> {
+    pub async fn send(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> proto::Result<()> {
         proto::validate_message_shape(data.len(), fds.len())?;
         self.check_send_health()?;
 
-        let progress = IoProgress::default();
-        let deadline = self.send_timeout.map(|d| Instant::now() + d);
-        let result = self.send_inner(data, fds, &progress, deadline);
-        if result.is_err() && progress.transferred_any() {
-            self.poison_send();
-        }
-        result
-    }
+        let progress = Arc::new(IoProgress::default());
+        let fut = self.send_inner(data, fds, Arc::clone(&progress));
 
-    pub fn recv(&self) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        self.check_recv_health()?;
-
-        let progress = IoProgress::default();
-        let deadline = self.recv_timeout.map(|d| Instant::now() + d);
-        let result = self.recv_inner(&progress, deadline);
-        if result.is_err() && progress.transferred_any() {
-            self.poison_recv();
-        }
-        result
-    }
-
-    fn send_inner(
-        &self,
-        data: &[u8],
-        fds: &[BorrowedFd<'_>],
-        progress: &IoProgress,
-        deadline: Option<Instant>,
-    ) -> proto::Result<()> {
-        let _lock = self.send_mu.lock().expect("send mutex poisoned");
-        self.check_send_health()?;
-
-        let mut hdr = [0u8; HEADER_LEN];
-        proto::encode_header(&mut hdr, data.len() as u32, fds.len() as u32);
-
-        if let Err(e) = self.send_raw_with_optional_fds(&hdr, fds, progress, deadline) {
-            self.poison_send();
-            return Err(e);
-        }
-        if let Err(e) = self.send_raw(data, progress, deadline) {
-            self.poison_send();
-            return Err(e);
-        }
-
-        Ok(())
-    }
-
-    fn recv_inner(&self, progress: &IoProgress, deadline: Option<Instant>) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        let _lock = self.recv_mu.lock().expect("recv mutex poisoned");
-        self.check_recv_health()?;
-
-        let mut hdr_buf = [0u8; HEADER_LEN];
-        let header_fds = match self.recv_header_with_fds(&mut hdr_buf, progress, deadline) {
-            Ok(fds) => fds,
-            Err(e) => {
-                if progress.transferred_any() {
-                    self.poison_recv();
+        match self.send_timeout {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if progress.transferred_any() {
+                        self.poison_send();
+                    }
+                    Err(ProtoError::Timeout(dur))
                 }
-                return Err(e);
-            }
-        };
-
-        let (payload_len, fd_count) = match proto::decode_header(&hdr_buf) {
-            Ok(v) => v,
-            Err(e) => {
-                self.poison_recv();
-                return Err(e);
-            }
-        };
-
-        if header_fds.len() != fd_count as usize {
-            self.poison_recv();
-            return Err(ProtoError::FdCountMismatch {
-                expected: fd_count as usize,
-                actual: header_fds.len(),
-            });
+            },
+            None => fut.await,
         }
+    }
 
-        let mut payload = vec![0u8; payload_len as usize];
-        if let Err(e) = self.recv_payload_exact(&mut payload, progress, deadline) {
-            if progress.transferred_any() {
-                self.poison_recv();
-            }
-            return Err(e);
+    pub async fn recv(&self) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        self.check_recv_health()?;
+
+        let progress = Arc::new(IoProgress::default());
+        let fut = self.recv_inner(Arc::clone(&progress));
+
+        match self.recv_timeout {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if progress.transferred_any() {
+                        self.poison_recv();
+                    }
+                    Err(ProtoError::Timeout(dur))
+                }
+            },
+            None => fut.await,
         }
-
-        let msg = Message { data: payload, fds: header_fds };
-        Ok((msg.data, msg.fds))
     }
 
     fn check_send_health(&self) -> proto::Result<()> {
@@ -244,23 +179,84 @@ impl Connection {
         }
     }
 
-    fn send_raw_with_optional_fds(
+    async fn send_inner(&self, data: &[u8], fds: &[BorrowedFd<'_>], progress: Arc<IoProgress>) -> proto::Result<()> {
+        let _lock = self.send_mu.lock().await;
+        self.check_send_health()?;
+
+        let mut hdr = [0u8; HEADER_LEN];
+        proto::encode_header(&mut hdr, data.len() as u32, fds.len() as u32);
+
+        if let Err(e) = self.send_raw_with_optional_fds(&hdr, fds, &progress).await {
+            self.poison_send();
+            return Err(e);
+        }
+        if let Err(e) = self.send_raw(data, &progress).await {
+            self.poison_send();
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    async fn recv_inner(&self, progress: Arc<IoProgress>) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
+        let _lock = self.recv_mu.lock().await;
+        self.check_recv_health()?;
+
+        let mut hdr_buf = [0u8; HEADER_LEN];
+        let header_fds = match self.recv_header_with_fds(&mut hdr_buf, &progress).await {
+            Ok(fds) => fds,
+            Err(e) => {
+                if progress.transferred_any() {
+                    self.poison_recv();
+                }
+                return Err(e);
+            }
+        };
+
+        let (payload_len, fd_count) = match proto::decode_header(&hdr_buf) {
+            Ok(v) => v,
+            Err(e) => {
+                self.poison_recv();
+                return Err(e);
+            }
+        };
+
+        if header_fds.len() != fd_count as usize {
+            self.poison_recv();
+            return Err(ProtoError::FdCountMismatch {
+                expected: fd_count as usize,
+                actual: header_fds.len(),
+            });
+        }
+
+        let mut payload = vec![0u8; payload_len as usize];
+        if let Err(e) = self.recv_payload_exact(&mut payload, &progress).await {
+            if progress.transferred_any() {
+                self.poison_recv();
+            }
+            return Err(e);
+        }
+
+        let msg = Message { data: payload, fds: header_fds };
+        Ok((msg.data, msg.fds))
+    }
+
+    async fn send_raw_with_optional_fds(
         &self,
         data: &[u8],
         fds: &[BorrowedFd<'_>],
         progress: &IoProgress,
-        deadline: Option<Instant>,
     ) -> proto::Result<()> {
         let stream = &self.socket.stream;
         let mut offset = 0usize;
         let mut first_send = true;
 
         while offset < data.len() {
-            wait_for_fd(stream.as_raw_fd(), true, deadline)?;
+            stream.writable().await?;
             let slice = &data[offset..];
             let fds_now = if first_send { fds } else { &[] };
 
-            match scm::sendmsg_fds(stream.as_fd(), slice, fds_now) {
+            match stream.try_io(Interest::WRITABLE, || scm::sendmsg_fds(stream.as_fd(), slice, fds_now)) {
                 Ok(0) => return Err(ProtoError::PeerClosed),
                 Ok(n) => {
                     progress.mark_progress(n);
@@ -276,7 +272,7 @@ impl Connection {
         Ok(())
     }
 
-    fn send_raw(&self, data: &[u8], progress: &IoProgress, deadline: Option<Instant>) -> proto::Result<()> {
+    async fn send_raw(&self, data: &[u8], progress: &IoProgress) -> proto::Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -285,9 +281,9 @@ impl Connection {
         let mut offset = 0usize;
 
         while offset < data.len() {
-            wait_for_fd(stream.as_raw_fd(), true, deadline)?;
+            stream.writable().await?;
             let slice = &data[offset..];
-            match scm::sendmsg_fds(stream.as_fd(), slice, &[]) {
+            match stream.try_io(Interest::WRITABLE, || scm::sendmsg_fds(stream.as_fd(), slice, &[])) {
                 Ok(0) => return Err(ProtoError::PeerClosed),
                 Ok(n) => {
                     progress.mark_progress(n);
@@ -302,21 +298,16 @@ impl Connection {
         Ok(())
     }
 
-    fn recv_header_with_fds(
-        &self,
-        buf: &mut [u8; HEADER_LEN],
-        progress: &IoProgress,
-        deadline: Option<Instant>,
-    ) -> proto::Result<Vec<OwnedFd>> {
+    async fn recv_header_with_fds(&self, buf: &mut [u8; HEADER_LEN], progress: &IoProgress) -> proto::Result<Vec<OwnedFd>> {
         let stream = &self.socket.stream;
         let mut offset = 0usize;
         let mut all_fds = Vec::new();
         let mut seen_any_fds = false;
 
         while offset < buf.len() {
-            wait_for_fd(stream.as_raw_fd(), false, deadline)?;
+            stream.readable().await?;
             let slice = &mut buf[offset..];
-            match scm::recvmsg_fds(stream.as_fd(), slice, MAX_FDS as usize) {
+            match stream.try_io(Interest::READABLE, || scm::recvmsg_fds(stream.as_fd(), slice, MAX_FDS as usize)) {
                 Ok((0, _)) => return Err(ProtoError::PeerClosed),
                 Ok((n, mut fds)) => {
                     if seen_any_fds && !fds.is_empty() {
@@ -338,7 +329,7 @@ impl Connection {
         Ok(all_fds)
     }
 
-    fn recv_payload_exact(&self, buf: &mut [u8], progress: &IoProgress, deadline: Option<Instant>) -> proto::Result<()> {
+    async fn recv_payload_exact(&self, buf: &mut [u8], progress: &IoProgress) -> proto::Result<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -347,9 +338,9 @@ impl Connection {
         let mut offset = 0usize;
 
         while offset < buf.len() {
-            wait_for_fd(stream.as_raw_fd(), false, deadline)?;
+            stream.readable().await?;
             let slice = &mut buf[offset..];
-            match scm::recvmsg_fds(stream.as_fd(), slice, 0) {
+            match stream.try_io(Interest::READABLE, || scm::recvmsg_fds(stream.as_fd(), slice, 0)) {
                 Ok((0, _)) => return Err(ProtoError::PeerClosed),
                 Ok((n, fds)) => {
                     if !fds.is_empty() {
@@ -368,45 +359,27 @@ impl Connection {
     }
 }
 
-fn wait_for_fd(raw_fd: i32, writable: bool, deadline: Option<Instant>) -> proto::Result<()> {
-    let mut pfd = libc::pollfd {
-        fd: raw_fd,
-        events: if writable { libc::POLLOUT } else { libc::POLLIN },
-        revents: 0,
-    };
+#[derive(Debug)]
+pub struct Listener {
+    inner: UnixListener,
+}
 
-    loop {
-        let timeout_ms = match deadline {
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(ProtoError::Timeout(Duration::from_secs(0)));
-                }
-                let remaining = deadline.saturating_duration_since(now);
-                let ms = remaining.as_millis();
-                ms.min(i32::MAX as u128) as i32
-            }
-            None => -1,
-        };
+impl Listener {
+    pub fn bind<P: AsRef<Path>>(path: P) -> proto::Result<Self> {
+        let inner = UnixListener::bind(path)?;
+        Ok(Self { inner })
+    }
 
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc > 0 {
-            if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-                return Err(ProtoError::PeerClosed);
-            }
-            return Ok(());
-        }
-        if rc == 0 {
-            let elapsed = deadline
-                .map(|d| d.saturating_duration_since(Instant::now()))
-                .unwrap_or_default();
-            return Err(ProtoError::Timeout(elapsed));
-        }
+    pub fn from_listener(inner: UnixListener) -> Self {
+        Self { inner }
+    }
 
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        return Err(e.into());
+    pub async fn accept(&self, config: Config) -> proto::Result<Connection> {
+        let (stream, _addr) = self.inner.accept().await?;
+        Ok(Connection::from_stream(stream, config))
+    }
+
+    pub fn inner(&self) -> &UnixListener {
+        &self.inner
     }
 }

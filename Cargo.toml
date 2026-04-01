@@ -1,15 +1,21 @@
 [package]
-name = "wireframe"
-version = "0.1.0"
+name = "fbsockets"
+version = "0.2.0"
 edition = "2021"
-description = "Production-grade async IPC protocol over Unix domain sockets with FD passing and fork detection"
-license = "MIT"
+description = "Low-level framed IPC over Unix domain sockets with FD passing, sync by default and optional async API"
+license = "BSD-3-Clause"
+repository = "https://github.com/yourname/fbsockets"
+rust-version = "1.75"
+
+[features]
+default = []
+async = ["dep:tokio"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "sync", "time"] }
 libc = "0.2"
-tracing = "0.1"
 thiserror = "1"
+tracing = "0.1"
+tokio = { version = "1", features = ["net", "rt", "time", "sync", "io-util"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
