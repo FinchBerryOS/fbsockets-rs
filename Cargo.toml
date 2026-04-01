@@ -1,0 +1,17 @@
+[package]
+name = "wireframe"
+version = "0.1.0"
+edition = "2021"
+description = "Production-grade async IPC protocol over Unix domain sockets with FD passing and fork detection"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "sync", "time"] }
+libc = "0.2"
+tracing = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
+libc = "0.2"
