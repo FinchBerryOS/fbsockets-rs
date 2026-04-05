@@ -47,7 +47,7 @@ impl Listener {
 
     pub fn accept(&self, config: Config) -> proto::Result<Connection> {
         let (stream, _addr) = self.inner.accept()?;
-        Ok(Connection::from_stream(stream, config))
+        Connection::from_stream(stream, config)
     }
 
     pub fn inner(&self) -> &UnixListener {

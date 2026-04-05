@@ -1,11 +1,9 @@
 [package]
 name = "fbsockets"
-version = "0.2.0"
-edition = "2021"
+version = "1.0.0"
+edition = "2024"
 description = "Low-level framed IPC over Unix domain sockets with FD passing, sync by default and optional async API"
 license = "BSD-3-Clause"
-repository = "https://github.com/yourname/fbsockets"
-rust-version = "1.75"
 
 [features]
 default = []

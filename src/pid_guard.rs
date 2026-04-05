@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! PID-based fork detection.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
 use crate::proto::ProtoError;
 
 #[derive(Debug)]
 pub struct PidGuard {
-    owner_pid: AtomicU32,
-    fork_seen: AtomicBool,
+    owner_pid: u32,
 }
 
 impl Default for PidGuard {
@@ -20,29 +17,22 @@ impl Default for PidGuard {
 impl PidGuard {
     pub fn new() -> Self {
         Self {
-            owner_pid: AtomicU32::new(std::process::id()),
-            fork_seen: AtomicBool::new(false),
+            owner_pid: std::process::id(),
         }
     }
 
     #[inline]
     pub fn check(&self) -> crate::proto::Result<()> {
-        let expected = self.owner_pid.load(Ordering::Relaxed);
+        let expected = self.owner_pid;
         let actual = std::process::id();
         if expected != actual {
-            self.fork_seen.store(true, Ordering::Relaxed);
             return Err(ProtoError::ForkDetected { expected, actual });
         }
         Ok(())
     }
 
     #[inline]
-    pub fn owner_pid(&self) -> u32 {
-        self.owner_pid.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn fork_seen(&self) -> bool {
-        self.fork_seen.load(Ordering::Relaxed)
+    pub const fn owner_pid(&self) -> u32 {
+        self.owner_pid
     }
 }

@@ -1,385 +1,167 @@
 // SPDX-License-Identifier: MIT
-//! Optional Tokio-based async API.
+//! Tokio async wrapper around the blocking `fbsockets` core.
+//!
+//! This module intentionally does not implement a second protocol engine.
+//! All framing, stop-and-wait semantics, ACK timing, FD handling, poisoning,
+//! and fork detection live in the blocking core (`crate::connection` and
+//! `crate::listener`). The async API delegates to that core via
+//! `tokio::task::spawn_blocking`.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-use tokio::io::Interest;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::task;
 
-use crate::pid_guard::PidGuard;
-use crate::proto::{self, Config, HEADER_LEN, MAX_FDS, Message, ProtoError};
-use crate::scm;
+use crate::connection::{self as blocking, PeerCredentials};
+use crate::listener as blocking_listener;
+use crate::proto::{self, Config, ProtoError};
 
-#[derive(Debug)]
-struct SharedSocket {
-    stream: UnixStream,
+fn join_error_to_proto(err: task::JoinError) -> ProtoError {
+    ProtoError::Io(std::io::Error::other(format!("async wrapper worker failed: {err}")))
 }
 
-impl SharedSocket {
-    fn new(stream: UnixStream) -> Arc<Self> {
-        Arc::new(Self { stream })
-    }
+fn clone_borrowed_fds(fds: &[BorrowedFd<'_>]) -> proto::Result<Vec<OwnedFd>> {
+    fds.iter()
+        .map(|fd| fd.try_clone_to_owned().map_err(ProtoError::from))
+        .collect()
 }
 
-#[derive(Debug, Default)]
-struct IoProgress {
-    transferred_any: AtomicBool,
-}
-
-impl IoProgress {
-    #[inline]
-    fn mark_progress(&self, n: usize) {
-        if n > 0 {
-            self.transferred_any.store(true, Ordering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn transferred_any(&self) -> bool {
-        self.transferred_any.load(Ordering::Relaxed)
-    }
-}
-
+#[derive(Clone, Debug)]
 pub struct Connection {
-    socket: Arc<SharedSocket>,
-    guard: Arc<PidGuard>,
-    send_timeout: Option<Duration>,
-    recv_timeout: Option<Duration>,
-    send_poisoned: AtomicBool,
-    recv_poisoned: AtomicBool,
-    fork_shutdown_done: AtomicBool,
-    send_mu: Mutex<()>,
-    recv_mu: Mutex<()>,
-}
-
-impl std::fmt::Debug for Connection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AsyncConnection")
-            .field("fd", &self.socket.stream.as_raw_fd())
-            .field("owner_pid", &self.guard.owner_pid())
-            .field("send_poisoned", &self.send_poisoned.load(Ordering::Relaxed))
-            .field("recv_poisoned", &self.recv_poisoned.load(Ordering::Relaxed))
-            .finish()
-    }
+    inner: Arc<blocking::Connection>,
 }
 
 impl Connection {
-    pub fn from_stream(stream: UnixStream, config: Config) -> Self {
-        Self {
-            socket: SharedSocket::new(stream),
-            guard: Arc::new(PidGuard::new()),
-            send_timeout: config.send_timeout,
-            recv_timeout: config.recv_timeout,
-            send_poisoned: AtomicBool::new(false),
-            recv_poisoned: AtomicBool::new(false),
-            fork_shutdown_done: AtomicBool::new(false),
-            send_mu: Mutex::new(()),
-            recv_mu: Mutex::new(()),
+    pub fn from_blocking(inner: blocking::Connection) -> Self {
+        Self { inner: Arc::new(inner) }
+    }
+
+    pub fn from_owned_fd(fd: OwnedFd, config: Config) -> proto::Result<Self> {
+        blocking::Connection::from_owned_fd(fd, config).map(Self::from_blocking)
+    }
+
+    /// # Safety
+    ///
+    /// `raw_fd` must be a valid owned Unix-domain stream socket file descriptor.
+    /// After calling this function, ownership is transferred into the returned
+    /// `Connection`, and the caller must not use or close `raw_fd` again.
+    pub unsafe fn from_raw_fd(raw_fd: RawFd, config: Config) -> proto::Result<Self> {
+        unsafe { blocking::Connection::from_raw_fd(raw_fd, config) }.map(Self::from_blocking)
+    }
+
+    pub fn into_blocking(self) -> Result<blocking::Connection, Self> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => Ok(inner),
+            Err(inner) => Err(Self { inner }),
         }
     }
 
     pub async fn connect<P: AsRef<Path>>(path: P, config: Config) -> proto::Result<Self> {
-        let stream = UnixStream::connect(path).await?;
-        Ok(Self::from_stream(stream, config))
+        let path = path.as_ref().to_path_buf();
+        let conn = task::spawn_blocking(move || blocking::Connection::connect(path, config))
+            .await
+            .map_err(join_error_to_proto)??;
+        Ok(Self::from_blocking(conn))
+    }
+
+    #[inline]
+    pub fn owner_pid(&self) -> u32 {
+        self.inner.owner_pid()
+    }
+
+    #[inline]
+    pub fn is_send_poisoned(&self) -> bool {
+        self.inner.is_send_poisoned()
+    }
+
+    #[inline]
+    pub fn is_recv_poisoned(&self) -> bool {
+        self.inner.is_recv_poisoned()
+    }
+
+    #[inline]
+    pub fn peer_credentials(&self) -> proto::Result<PeerCredentials> {
+        self.inner.peer_credentials()
+    }
+
+    #[inline]
+    pub fn peer_pid(&self) -> proto::Result<Option<u32>> {
+        self.inner.peer_pid()
+    }
+
+    #[inline]
+    pub fn peer_uid(&self) -> proto::Result<Option<u32>> {
+        self.inner.peer_uid()
+    }
+
+    #[inline]
+    pub fn peer_gid(&self) -> proto::Result<Option<u32>> {
+        self.inner.peer_gid()
     }
 
     pub async fn send(&self, data: &[u8], fds: &[BorrowedFd<'_>]) -> proto::Result<()> {
+        // Validate before cloning so callers get the same fast-path errors as the core.
         proto::validate_message_shape(data.len(), fds.len())?;
-        self.check_send_health()?;
 
-        let progress = Arc::new(IoProgress::default());
-        let fut = self.send_inner(data, fds, Arc::clone(&progress));
+        let inner = Arc::clone(&self.inner);
+        let data = data.to_vec();
+        let owned_fds = clone_borrowed_fds(fds)?;
 
-        match self.send_timeout {
-            Some(dur) => match tokio::time::timeout(dur, fut).await {
-                Ok(result) => result,
-                Err(_) => {
-                    if progress.transferred_any() {
-                        self.poison_send();
-                    }
-                    Err(ProtoError::Timeout(dur))
-                }
-            },
-            None => fut.await,
-        }
+        task::spawn_blocking(move || {
+            let borrowed: Vec<_> = owned_fds.iter().map(|fd| fd.as_fd()).collect();
+            inner.send(&data, &borrowed)
+        })
+        .await
+        .map_err(join_error_to_proto)?
     }
 
     pub async fn recv(&self) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        self.check_recv_health()?;
-
-        let progress = Arc::new(IoProgress::default());
-        let fut = self.recv_inner(Arc::clone(&progress));
-
-        match self.recv_timeout {
-            Some(dur) => match tokio::time::timeout(dur, fut).await {
-                Ok(result) => result,
-                Err(_) => {
-                    if progress.transferred_any() {
-                        self.poison_recv();
-                    }
-                    Err(ProtoError::Timeout(dur))
-                }
-            },
-            None => fut.await,
-        }
-    }
-
-    fn check_send_health(&self) -> proto::Result<()> {
-        if self.send_poisoned.load(Ordering::Relaxed) {
-            return Err(ProtoError::Poisoned);
-        }
-        self.guard.check().map_err(|e| {
-            self.handle_fork_shutdown();
-            self.send_poisoned.store(true, Ordering::Relaxed);
-            self.recv_poisoned.store(true, Ordering::Relaxed);
-            e
-        })
-    }
-
-    fn check_recv_health(&self) -> proto::Result<()> {
-        if self.recv_poisoned.load(Ordering::Relaxed) {
-            return Err(ProtoError::Poisoned);
-        }
-        self.guard.check().map_err(|e| {
-            self.handle_fork_shutdown();
-            self.send_poisoned.store(true, Ordering::Relaxed);
-            self.recv_poisoned.store(true, Ordering::Relaxed);
-            e
-        })
-    }
-
-    fn handle_fork_shutdown(&self) {
-        if self
-            .fork_shutdown_done
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let fd = self.socket.stream.as_raw_fd();
-            unsafe {
-                libc::shutdown(fd, libc::SHUT_RDWR);
-            }
-            tracing::warn!(fd, owner_pid = self.guard.owner_pid(), "fork detected; socket shut down in child process");
-        }
-    }
-
-    fn poison_send(&self) {
-        if !self.send_poisoned.swap(true, Ordering::Relaxed) {
-            tracing::error!(fd = self.socket.stream.as_raw_fd(), "send side poisoned");
-        }
-    }
-
-    fn poison_recv(&self) {
-        if !self.recv_poisoned.swap(true, Ordering::Relaxed) {
-            tracing::error!(fd = self.socket.stream.as_raw_fd(), "recv side poisoned");
-        }
-    }
-
-    async fn send_inner(&self, data: &[u8], fds: &[BorrowedFd<'_>], progress: Arc<IoProgress>) -> proto::Result<()> {
-        let _lock = self.send_mu.lock().await;
-        self.check_send_health()?;
-
-        let mut hdr = [0u8; HEADER_LEN];
-        proto::encode_header(&mut hdr, data.len() as u32, fds.len() as u32);
-
-        if let Err(e) = self.send_raw_with_optional_fds(&hdr, fds, &progress).await {
-            self.poison_send();
-            return Err(e);
-        }
-        if let Err(e) = self.send_raw(data, &progress).await {
-            self.poison_send();
-            return Err(e);
-        }
-
-        Ok(())
-    }
-
-    async fn recv_inner(&self, progress: Arc<IoProgress>) -> proto::Result<(Vec<u8>, Vec<OwnedFd>)> {
-        let _lock = self.recv_mu.lock().await;
-        self.check_recv_health()?;
-
-        let mut hdr_buf = [0u8; HEADER_LEN];
-        let header_fds = match self.recv_header_with_fds(&mut hdr_buf, &progress).await {
-            Ok(fds) => fds,
-            Err(e) => {
-                if progress.transferred_any() {
-                    self.poison_recv();
-                }
-                return Err(e);
-            }
-        };
-
-        let (payload_len, fd_count) = match proto::decode_header(&hdr_buf) {
-            Ok(v) => v,
-            Err(e) => {
-                self.poison_recv();
-                return Err(e);
-            }
-        };
-
-        if header_fds.len() != fd_count as usize {
-            self.poison_recv();
-            return Err(ProtoError::FdCountMismatch {
-                expected: fd_count as usize,
-                actual: header_fds.len(),
-            });
-        }
-
-        let mut payload = vec![0u8; payload_len as usize];
-        if let Err(e) = self.recv_payload_exact(&mut payload, &progress).await {
-            if progress.transferred_any() {
-                self.poison_recv();
-            }
-            return Err(e);
-        }
-
-        let msg = Message { data: payload, fds: header_fds };
-        Ok((msg.data, msg.fds))
-    }
-
-    async fn send_raw_with_optional_fds(
-        &self,
-        data: &[u8],
-        fds: &[BorrowedFd<'_>],
-        progress: &IoProgress,
-    ) -> proto::Result<()> {
-        let stream = &self.socket.stream;
-        let mut offset = 0usize;
-        let mut first_send = true;
-
-        while offset < data.len() {
-            stream.writable().await?;
-            let slice = &data[offset..];
-            let fds_now = if first_send { fds } else { &[] };
-
-            match stream.try_io(Interest::WRITABLE, || scm::sendmsg_fds(stream.as_fd(), slice, fds_now)) {
-                Ok(0) => return Err(ProtoError::PeerClosed),
-                Ok(n) => {
-                    progress.mark_progress(n);
-                    offset += n;
-                    first_send = false;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn send_raw(&self, data: &[u8], progress: &IoProgress) -> proto::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let stream = &self.socket.stream;
-        let mut offset = 0usize;
-
-        while offset < data.len() {
-            stream.writable().await?;
-            let slice = &data[offset..];
-            match stream.try_io(Interest::WRITABLE, || scm::sendmsg_fds(stream.as_fd(), slice, &[])) {
-                Ok(0) => return Err(ProtoError::PeerClosed),
-                Ok(n) => {
-                    progress.mark_progress(n);
-                    offset += n;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn recv_header_with_fds(&self, buf: &mut [u8; HEADER_LEN], progress: &IoProgress) -> proto::Result<Vec<OwnedFd>> {
-        let stream = &self.socket.stream;
-        let mut offset = 0usize;
-        let mut all_fds = Vec::new();
-        let mut seen_any_fds = false;
-
-        while offset < buf.len() {
-            stream.readable().await?;
-            let slice = &mut buf[offset..];
-            match stream.try_io(Interest::READABLE, || scm::recvmsg_fds(stream.as_fd(), slice, MAX_FDS as usize)) {
-                Ok((0, _)) => return Err(ProtoError::PeerClosed),
-                Ok((n, mut fds)) => {
-                    if seen_any_fds && !fds.is_empty() {
-                        return Err(ProtoError::UnexpectedFds(fds.len()));
-                    }
-                    if !fds.is_empty() {
-                        seen_any_fds = true;
-                    }
-                    progress.mark_progress(n);
-                    offset += n;
-                    all_fds.append(&mut fds);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(all_fds)
-    }
-
-    async fn recv_payload_exact(&self, buf: &mut [u8], progress: &IoProgress) -> proto::Result<()> {
-        if buf.is_empty() {
-            return Ok(());
-        }
-
-        let stream = &self.socket.stream;
-        let mut offset = 0usize;
-
-        while offset < buf.len() {
-            stream.readable().await?;
-            let slice = &mut buf[offset..];
-            match stream.try_io(Interest::READABLE, || scm::recvmsg_fds(stream.as_fd(), slice, 0)) {
-                Ok((0, _)) => return Err(ProtoError::PeerClosed),
-                Ok((n, fds)) => {
-                    if !fds.is_empty() {
-                        return Err(ProtoError::UnexpectedFds(fds.len()));
-                    }
-                    progress.mark_progress(n);
-                    offset += n;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        Ok(())
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || inner.recv())
+            .await
+            .map_err(join_error_to_proto)?
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Listener {
-    inner: UnixListener,
+    inner: Arc<blocking_listener::Listener>,
 }
 
 impl Listener {
-    pub fn bind<P: AsRef<Path>>(path: P) -> proto::Result<Self> {
-        let inner = UnixListener::bind(path)?;
-        Ok(Self { inner })
+    pub async fn bind<P: AsRef<Path>>(path: P) -> proto::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let listener = task::spawn_blocking(move || blocking_listener::Listener::bind(path))
+            .await
+            .map_err(join_error_to_proto)??;
+        Ok(Self { inner: Arc::new(listener) })
     }
 
-    pub fn from_listener(inner: UnixListener) -> Self {
-        Self { inner }
+    pub async fn bind_clean<P: AsRef<Path>>(path: P) -> proto::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let listener = task::spawn_blocking(move || blocking_listener::Listener::bind_clean(path))
+            .await
+            .map_err(join_error_to_proto)??;
+        Ok(Self { inner: Arc::new(listener) })
+    }
+
+    pub fn from_blocking(inner: blocking_listener::Listener) -> Self {
+        Self { inner: Arc::new(inner) }
+    }
+
+    pub fn into_blocking(self) -> Result<blocking_listener::Listener, Self> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => Ok(inner),
+            Err(inner) => Err(Self { inner }),
+        }
     }
 
     pub async fn accept(&self, config: Config) -> proto::Result<Connection> {
-        let (stream, _addr) = self.inner.accept().await?;
-        Ok(Connection::from_stream(stream, config))
-    }
-
-    pub fn inner(&self) -> &UnixListener {
-        &self.inner
+        let inner = Arc::clone(&self.inner);
+        let conn = task::spawn_blocking(move || inner.accept(config))
+            .await
+            .map_err(join_error_to_proto)??;
+        Ok(Connection::from_blocking(conn))
     }
 }

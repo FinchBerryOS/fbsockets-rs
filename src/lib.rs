@@ -1,45 +1,19 @@
 // SPDX-License-Identifier: MIT
-//! `fbsockets` — low-level framed IPC over Unix domain sockets.
+//! `fbsockets` — framed IPC over Unix domain sockets.
 //!
-//! Default API:
-//! - blocking [`Connection`] and [`Listener`]
-//! - one send operation and one receive operation at a time
-//! - up to 16 MiB payload per message
-//! - up to 64 file descriptors per message
-//! - fork detection: inherited sockets are shut down in the child on first use
+//! Current core semantics:
+//! - blocking core is the single source of truth
+//! - stop-and-wait delivery with ACK per logical message
+//! - max 256 KiB payload per logical message
+//! - optional FD passing via `SCM_RIGHTS`
+//! - one background reader thread per blocking connection
+//! - `recv()` returns only after its ACK was successfully sent
+//! - a second DATA before ACK is a protocol violation
+//! - inherited sockets are invalidated on first use after `fork()` in the child
+//! - connections can also be constructed from an owned Unix socket file descriptor
 //!
 //! Optional feature:
-//! - `async`: enables [`r#async::Connection`] and [`r#async::Listener`] on top of Tokio
-//!
-//! # Blocking example
-//! ```rust,no_run
-//! use fbsockets::{Config, Connection};
-//!
-//! # fn demo() -> fbsockets::Result<()> {
-//! let conn = Connection::connect("/tmp/fbsockets.sock", Config::default())?;
-//! conn.send(b"ping", &[])?;
-//! let (data, fds) = conn.recv()?;
-//! assert_eq!(data, b"pong");
-//! assert!(fds.is_empty());
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Async example
-//! ```rust,no_run
-//! # #[cfg(feature = "async")]
-//! # async fn demo() -> fbsockets::Result<()> {
-//! use fbsockets::{Config};
-//! use fbsockets::r#async::Connection;
-//!
-//! let conn = Connection::connect("/tmp/fbsockets.sock", Config::default()).await?;
-//! conn.send(b"ping", &[]).await?;
-//! let (data, fds) = conn.recv().await?;
-//! assert_eq!(data, b"pong");
-//! assert!(fds.is_empty());
-//! # Ok(())
-//! # }
-//! ```
+//! - `async`: Tokio wrapper around the blocking core via `spawn_blocking`
 
 pub mod connection;
 pub mod listener;
@@ -50,6 +24,6 @@ pub mod scm;
 #[cfg(feature = "async")]
 pub mod r#async;
 
-pub use connection::Connection;
+pub use connection::{Connection, PeerCredentials};
 pub use listener::Listener;
 pub use proto::{Config, Message, ProtoError, Result};

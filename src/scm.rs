@@ -26,6 +26,31 @@ pub fn cmsg_space_for_fd_count(n: usize) -> usize {
     unsafe { libc::CMSG_SPACE((n * std::mem::size_of::<i32>()) as libc::c_uint) as usize }
 }
 
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_cloexec(fd: i32) -> io::Result<()> {
+    loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
 pub fn sendmsg_fds(socket_fd: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
 
@@ -50,7 +75,7 @@ pub fn sendmsg_fds(socket_fd: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'_>
         iov_len: data.len(),
     };
 
-    let mut cmsg_buf = vec![0u8; cmsg_buf_len.max(1)];
+    let mut cmsg_buf = vec![0u8; cmsg_buf_len];
     let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
     mhdr.msg_iov = &mut iov;
     mhdr.msg_iovlen = 1;
@@ -100,7 +125,7 @@ pub fn recvmsg_fds(socket_fd: BorrowedFd<'_>, buf: &mut [u8], max_fds: usize) ->
         iov_len: buf.len(),
     };
 
-    let mut cmsg_buf = vec![0u8; cmsg_buf_len.max(1)];
+    let mut cmsg_buf = vec![0u8; cmsg_buf_len];
     let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
     mhdr.msg_iov = &mut iov;
     mhdr.msg_iovlen = 1;
@@ -134,6 +159,8 @@ pub fn recvmsg_fds(socket_fd: BorrowedFd<'_>, buf: &mut [u8], max_fds: usize) ->
 
                     for i in 0..data_len {
                         let raw = std::ptr::read(data_ptr.add(i));
+                        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                        set_cloexec(raw)?;
                         received_fds.push(OwnedFd::from_raw_fd(raw));
                     }
                 }
