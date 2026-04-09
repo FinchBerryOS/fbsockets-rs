@@ -34,30 +34,6 @@ This crate is low level because it works directly with:
 
 It is transport infrastructure, not an RPC framework.
 
-## Cargo setup
-
-### Blocking only
-
-```toml
-[dependencies]
-fbsockets = { git = "https://github.com/yourname/fbsockets.git" }
-```
-
-### Blocking + async
-
-```toml
-[dependencies]
-fbsockets = { git = "https://github.com/yourname/fbsockets.git", features = ["async"] }
-tokio = { version = "1", features = ["full"] }
-```
-
-### Local path dependency
-
-```toml
-[dependencies]
-fbsockets = { path = "../fbsockets-rs" }
-```
-
 ## Blocking API
 
 The blocking API is the default API.
